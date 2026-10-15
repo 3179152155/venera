@@ -652,7 +652,11 @@ const Set<PointerDeviceKind> _kTouchLikeDeviceTypes = <PointerDeviceKind>{
   PointerDeviceKind.unknown,
 };
 
-const double _kChangeChapterOffset = 160;
+// A small overscroll fallback is kept for touch devices whose scroll end
+// notification arrives before the boundary update. Continuous reading now
+// changes chapter as soon as the list reaches its boundary, so users do not
+// need to perform a large extra swipe between chapters.
+const double _kChangeChapterOffset = 24;
 
 class _ContinuousMode extends StatefulWidget {
   const _ContinuousMode({super.key});
@@ -712,6 +716,10 @@ class _ContinuousModeState extends State<_ContinuousMode>
     Future.delayed(
       const Duration(milliseconds: 100),
       () => cacheImages(reader.page),
+    );
+    Future.delayed(
+      const Duration(milliseconds: 250),
+      _preloadNextChapter,
     );
     super.initState();
   }
@@ -802,6 +810,51 @@ class _ContinuousModeState extends State<_ContinuousMode>
     }
   }
 
+  /// Fetch the next chapter's image list and cache its first few images while
+  /// the current chapter is being read. The reader still loads the complete
+  /// chapter normally after switching, but its boundary is already warm.
+  Future<void> _preloadNextChapter() async {
+    if (!mounted || reader.widget.chapters == null) return;
+    final chapters = reader.widget.chapters!;
+    final source = reader.type.comicSource;
+    final nextIndex = reader.chapter; // chapter is 1-based
+    if (source?.loadComicPages == null || nextIndex >= chapters.length) {
+      return;
+    }
+
+    final nextEid = chapters.ids.elementAt(nextIndex);
+    if (LocalManager().isDownloaded(
+      reader.cid,
+      reader.type,
+      nextIndex + 1,
+      chapters,
+    )) {
+      return;
+    }
+
+    try {
+      final result = await source!.loadComicPages!(reader.cid, nextEid);
+      if (result.error || result.data.isEmpty || !mounted) return;
+      final count = math.min(result.data.length, math.max(1, preCacheCount));
+      await Future.wait(
+        result.data.take(count).map((url) async {
+          try {
+            await ImageDownloader.loadComicImage(
+              url,
+              source.key,
+              reader.cid,
+              nextEid,
+            ).drain<void>();
+          } catch (_) {
+            // A failed warm-up must not prevent normal chapter loading.
+          }
+        }),
+      );
+    } catch (_) {
+      // The normal reader path will retry the chapter when the user opens it.
+    }
+  }
+
   void onScroll() {
     if (prepareToPrevChapter) {
       jumpToNextChapter = false;
@@ -813,6 +866,32 @@ class _ContinuousModeState extends State<_ContinuousMode>
           scrollController.offset >
           scrollController.position.maxScrollExtent + _kChangeChapterOffset;
       jumpToPrevChapter = false;
+    }
+  }
+
+  void _changeChapterAtBoundary() {
+    if (prepareToPrevChapter &&
+        scrollController.position.pixels <=
+            scrollController.position.minScrollExtent) {
+      context.readerScaffold.setFloatingButton(0);
+      setState(() {
+        prepareToPrevChapter = false;
+        prepareToNextChapter = false;
+      });
+      jumpToPrevChapter = false;
+      jumpToNextChapter = false;
+      reader.toPrevChapter(toLastPage: true);
+    } else if (prepareToNextChapter &&
+        scrollController.position.pixels >=
+            scrollController.position.maxScrollExtent) {
+      context.readerScaffold.setFloatingButton(0);
+      setState(() {
+        prepareToPrevChapter = false;
+        prepareToNextChapter = false;
+      });
+      jumpToPrevChapter = false;
+      jumpToNextChapter = false;
+      reader.toNextChapter();
     }
   }
 
@@ -976,6 +1055,11 @@ class _ContinuousModeState extends State<_ContinuousMode>
           delayedSetIsScrolling(true);
         } else if (notification is ScrollEndNotification) {
           delayedSetIsScrolling(false);
+          // Reaching the first/last image is enough to continue reading.
+          // This removes the old requirement to overscroll by 160 pixels.
+          if (!isZoomedIn) {
+            _changeChapterAtBoundary();
+          }
         }
 
         var scale = photoViewController.scale ?? 1.0;
